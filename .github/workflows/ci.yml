@@ -1,0 +1,508 @@
+name: Build and Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+  repository_dispatch:
+    types:
+      - sync-repo
+
+defaults:
+  run:
+    shell: bash
+
+permissions:
+  contents: write
+
+concurrency:
+  group: rime-mem-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+  # 私有仓库访问
+  RIME_MEM_PRIVATE_REPO_TOKEN: ${{ secrets.RIME_MEM_PRI_TOKEN }}
+  RIME_MEM_PRIVATE_REPO_SLUG: ${{ vars.RIME_MEM_PRIVATE_REPO_SLUG || 'pylab-me/rime-mem-pri' }}
+  RIME_MEM_PRIVATE_REPO_REF: ${{ vars.RIME_MEM_PRIVATE_REPO_REF || 'main' }}
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: windows-x64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            ext: dll
+            lib_name: librime_rust_mem.dll
+            artifact_name: package-windows-x64
+            package_name: rime-mem-x86_64-pc-windows-msvc.zip
+            package_kind: zip
+
+          - name: linux-x86_64
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            ext: so
+            lib_name: librime_rust_mem.so
+            artifact_name: package-linux-x86_64
+            package_name: rime-mem-x86_64-unknown-linux-gnu.zip
+            package_kind: zip
+
+          # 这两个先产出 raw dylib，只给 universal job 使用
+          - name: macos-intel
+            os: macos-15-intel
+            target: x86_64-apple-darwin
+            ext: dylib
+            lib_name: librime_rust_mem.dylib
+            artifact_name: raw-macos-intel
+            package_kind: raw
+
+          - name: macos-arm64
+            os: macos-15
+            target: aarch64-apple-darwin
+            ext: dylib
+            lib_name: librime_rust_mem.dylib
+            artifact_name: raw-macos-arm64
+            package_kind: raw
+
+    steps:
+      - name: Checkout public repo
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Check private repo token
+        run: |
+          if [ -z "${RIME_MEM_PRIVATE_REPO_TOKEN}" ]; then
+            echo "Missing secret: RIME_MEM_PRI_TOKEN"
+            echo "This secret must have read access to ${RIME_MEM_PRIVATE_REPO_SLUG}"
+            exit 1
+          fi
+
+      - name: Checkout private repo
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ env.RIME_MEM_PRIVATE_REPO_SLUG }}
+          token: ${{ env.RIME_MEM_PRIVATE_REPO_TOKEN }}
+          ref: ${{ env.RIME_MEM_PRIVATE_REPO_REF }}
+          path: private-src
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Sync lua into public workspace
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import shutil
+
+          src = Path("private-src/lua")
+          dst = Path("lua")
+
+          if not src.exists():
+              raise SystemExit(f"lua source not found: {src}")
+
+          if dst.exists():
+              shutil.rmtree(dst)
+
+          copied = 0
+          for f in src.rglob("*.lua"):
+              rel = f.relative_to(src)
+              out = dst / rel
+              out.parent.mkdir(parents=True, exist_ok=True)
+              shutil.copy2(f, out)
+              copied += 1
+
+          print(f"synced {copied} lua files into public workspace -> {dst}")
+          PY
+
+      - name: Verify workspace
+        run: |
+          echo "Workspace root:"
+          ls -la
+          echo
+          echo "Public lua:"
+          find lua -type f || true
+          echo
+          echo "Private repo:"
+          ls -la private-src
+
+      - name: Set up Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable-${{ matrix.target }}
+          cache: true
+
+      - name: Ensure host toolchain exists
+        run: |
+          rustup set profile minimal
+          rustup toolchain install stable-${{ matrix.target }}
+
+      - name: Add target
+        run: rustup target add ${{ matrix.target }}
+
+      - name: Build release library
+        working-directory: private-src/rime_mem
+        run: rustup run stable-${{ matrix.target }} cargo build --release --target ${{ matrix.target }}
+
+      #      - name: Inspect release dir
+      #        run: |
+      #          ls -la "private-src/rime_mem/target/${{ matrix.target }}/release" || true
+
+      - name: Resolve built library
+        id: resolve_lib
+        run: |
+          OUT_DIR="private-src/rime_mem/target/${{ matrix.target }}/release"
+
+          if [ "${{ matrix.ext }}" = "dll" ]; then
+            if [ -f "${OUT_DIR}/librime_rust_mem.dll" ]; then
+              SRC="${OUT_DIR}/librime_rust_mem.dll"
+            elif [ -f "${OUT_DIR}/liblibrime_rust_mem.dll" ]; then
+              SRC="${OUT_DIR}/liblibrime_rust_mem.dll"
+            else
+              echo "No Windows dll found in ${OUT_DIR}"
+              ls -la "${OUT_DIR}" || true
+              exit 1
+            fi
+          else
+            if [ -f "${OUT_DIR}/liblibrime_rust_mem.${{ matrix.ext }}" ]; then
+              SRC="${OUT_DIR}/liblibrime_rust_mem.${{ matrix.ext }}"
+            elif [ -f "${OUT_DIR}/librime_rust_mem.${{ matrix.ext }}" ]; then
+              SRC="${OUT_DIR}/librime_rust_mem.${{ matrix.ext }}"
+            else
+              echo "No library found in ${OUT_DIR}"
+              ls -la "${OUT_DIR}" || true
+              exit 1
+            fi
+          fi
+
+          echo "src=${SRC}" >> "$GITHUB_OUTPUT"
+          echo "resolved src=${SRC}"
+
+      - name: Build package payload
+        if: matrix.package_kind == 'zip'
+        run: |
+          rm -rf stage/package
+          mkdir -p stage/package
+          cp "${{ steps.resolve_lib.outputs.src }}" "stage/package/${{ matrix.lib_name }}"
+
+          python - <<'PY'
+          from pathlib import Path
+          import shutil
+
+          src = Path("lua")
+          dst = Path("stage/package/lua")
+          dst.mkdir(parents=True, exist_ok=True)
+
+          copied = 0
+          for f in src.rglob("*.lua"):
+              rel = f.relative_to(src)
+              out = dst / rel
+              out.parent.mkdir(parents=True, exist_ok=True)
+              shutil.copy2(f, out)
+              copied += 1
+
+          print(f"copied {copied} lua files into package payload")
+          PY
+
+      - name: Create zip package
+        if: matrix.package_kind == 'zip'
+        run: |
+          mkdir -p dist
+          python - <<'PY'
+          from pathlib import Path
+          import zipfile
+
+          src = Path("stage/package")
+          zip_path = Path("dist") / "${{ matrix.package_name }}"
+
+          with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+              for p in sorted(src.rglob("*")):
+                  if p.is_file():
+                      zf.write(p, p.relative_to(src))
+
+          print(f"created {zip_path}")
+          PY
+
+      - name: Save raw dylib for universal
+        if: matrix.package_kind == 'raw'
+        run: |
+          mkdir -p dist
+          cp "${{ steps.resolve_lib.outputs.src }}" "dist/${{ matrix.lib_name }}"
+
+      - name: Upload package artifact
+        if: matrix.package_kind == 'zip'
+        uses: actions/upload-artifact@v6
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: dist/${{ matrix.package_name }}
+          if-no-files-found: error
+          retention-days: 3
+
+      - name: Upload raw macOS dylib artifact
+        if: matrix.package_kind == 'raw'
+        uses: actions/upload-artifact@v6
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: dist/${{ matrix.lib_name }}
+          if-no-files-found: error
+          retention-days: 3
+
+  macos-universal:
+    name: macos-universal
+    runs-on: macos-14
+    needs: build
+
+    steps:
+      - name: Checkout public repo
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Check private repo token
+        run: |
+          if [ -z "${RIME_MEM_PRIVATE_REPO_TOKEN}" ]; then
+            echo "Missing secret: RIME_MEM_PRI_TOKEN"
+            echo "This secret must have read access to ${RIME_MEM_PRIVATE_REPO_SLUG}"
+            exit 1
+          fi
+
+      - name: Checkout private repo
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ env.RIME_MEM_PRIVATE_REPO_SLUG }}
+          token: ${{ env.RIME_MEM_PRIVATE_REPO_TOKEN }}
+          ref: ${{ env.RIME_MEM_PRIVATE_REPO_REF }}
+          path: private-src
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Sync lua into public workspace
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import shutil
+
+          src = Path("private-src/lua")
+          dst = Path("lua")
+
+          if not src.exists():
+              raise SystemExit(f"lua source not found: {src}")
+
+          if dst.exists():
+              shutil.rmtree(dst)
+
+          copied = 0
+          for f in src.rglob("*.lua"):
+              rel = f.relative_to(src)
+              out = dst / rel
+              out.parent.mkdir(parents=True, exist_ok=True)
+              shutil.copy2(f, out)
+              copied += 1
+
+          print(f"synced {copied} lua files into public workspace -> {dst}")
+          PY
+
+      - name: Download raw macOS intel artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: raw-macos-intel
+          path: macos-intel
+
+      - name: Download raw macOS arm64 artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: raw-macos-arm64
+          path: macos-arm64
+
+      - name: Inspect downloaded dylibs
+        run: |
+          ls -la macos-intel
+          ls -la macos-arm64
+          file "macos-intel/librime_rust_mem.dylib"
+          file "macos-arm64/librime_rust_mem.dylib"
+          lipo -info "macos-intel/librime_rust_mem.dylib"
+          lipo -info "macos-arm64/librime_rust_mem.dylib"
+
+      - name: Create universal dylib
+        run: |
+          mkdir -p dist
+          lipo -create \
+            "macos-intel/librime_rust_mem.dylib" \
+            "macos-arm64/librime_rust_mem.dylib" \
+            -output "dist/librime_rust_mem.dylib"
+
+      - name: Verify universal dylib
+        run: |
+          file "dist/librime_rust_mem.dylib"
+          lipo -info "dist/librime_rust_mem.dylib"
+
+      - name: Build universal package payload
+        run: |
+          rm -rf stage/package
+          mkdir -p stage/package
+          cp "dist/librime_rust_mem.dylib" "stage/package/librime_rust_mem.dylib"
+
+          python - <<'PY'
+          from pathlib import Path
+          import shutil
+
+          src = Path("lua")
+          dst = Path("stage/package/lua")
+          dst.mkdir(parents=True, exist_ok=True)
+
+          copied = 0
+          for f in src.rglob("*.lua"):
+              rel = f.relative_to(src)
+              out = dst / rel
+              out.parent.mkdir(parents=True, exist_ok=True)
+              shutil.copy2(f, out)
+              copied += 1
+
+          print(f"copied {copied} lua files into macOS universal package")
+          PY
+
+      - name: Create universal zip package
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import zipfile
+
+          src = Path("stage/package")
+          zip_path = Path("dist") / "rime-mem-macos-universal.zip"
+
+          with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+              for p in sorted(src.rglob("*")):
+                  if p.is_file():
+                      zf.write(p, p.relative_to(src))
+
+          print(f"created {zip_path}")
+          PY
+
+      - name: Upload universal package artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: package-macos-universal
+          path: dist/rime-mem-macos-universal.zip
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+  release:
+    name: Publish GitHub Release
+    runs-on: ubuntu-latest
+    needs:
+      - build
+      - macos-universal
+
+    steps:
+      - name: Download package artifacts
+        uses: actions/download-artifact@v8
+        with:
+          pattern: package-*
+          path: release-assets
+          merge-multiple: true
+
+      - name: Show release assets
+        run: ls -la release-assets
+
+      - name: Prepare release metadata
+        id: meta
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            echo "tag_name=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+            echo "release_name=Release ${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+            echo "make_latest=true" >> "$GITHUB_OUTPUT"
+
+            {
+              echo 'body<<EOF'
+              echo "Stable release for ${GITHUB_REF_NAME}"
+              echo
+              echo "- ref: ${GITHUB_REF}"
+              echo "- sha: ${GITHUB_SHA}"
+              echo "- event: ${GITHUB_EVENT_NAME}"
+              echo "EOF"
+            } >> "$GITHUB_OUTPUT"
+          else
+            echo "tag_name=staging" >> "$GITHUB_OUTPUT"
+            echo "release_name=Staging (${GITHUB_REF_NAME:-manual})" >> "$GITHUB_OUTPUT"
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+            echo "make_latest=false" >> "$GITHUB_OUTPUT"
+
+            {
+              echo 'body<<EOF'
+              echo "Rolling staging release"
+              echo
+              echo "- ref: ${GITHUB_REF}"
+              echo "- sha: ${GITHUB_SHA}"
+              echo "- event: ${GITHUB_EVENT_NAME}"
+              echo
+              echo "This release is continuously overwritten by non-tag runs."
+              echo "EOF"
+            } >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Move staging tag to current commit
+        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const tag = "staging";
+            const sha = context.sha;
+
+            try {
+              await github.rest.git.getRef({
+                owner,
+                repo,
+                ref: `tags/${tag}`,
+              });
+
+              await github.rest.git.updateRef({
+                owner,
+                repo,
+                ref: `tags/${tag}`,
+                sha,
+                force: true,
+              });
+
+              core.info(`Updated tag ${tag} -> ${sha}`);
+            } catch (error) {
+              if (error.status === 404) {
+                await github.rest.git.createRef({
+                  owner,
+                  repo,
+                  ref: `refs/tags/${tag}`,
+                  sha,
+                });
+                core.info(`Created tag ${tag} -> ${sha}`);
+              } else {
+                throw error;
+              }
+            }
+
+      - name: Create or update GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.meta.outputs.tag_name }}
+          target_commitish: ${{ github.sha }}
+          name: ${{ steps.meta.outputs.release_name }}
+          body: ${{ steps.meta.outputs.body }}
+          prerelease: ${{ steps.meta.outputs.prerelease }}
+          make_latest: ${{ steps.meta.outputs.make_latest }}
+          overwrite_files: true
+          files: |
+            release-assets/*.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
