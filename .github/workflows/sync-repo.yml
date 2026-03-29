@@ -78,6 +78,18 @@ jobs:
           git status --short
           find lua -type f | sort || true
 
+      - name: Read crate version
+        id: crate_version
+        run: |
+          python - <<'PY' >> "$GITHUB_OUTPUT"
+          from pathlib import Path
+          import tomllib
+
+          cargo_toml = Path("private-src/rime_mem/Cargo.toml")
+          data = tomllib.loads(cargo_toml.read_text(encoding="utf-8"))
+          print(f"version={data['package']['version']}")
+          PY
+
       - name: Commit changes
         id: commit
         run: |
@@ -91,7 +103,7 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           
           git add lua
-          git commit -m "chore(lua): sync from ${RIME_MEM_PRIVATE_REPO_SLUG}@${RIME_MEM_PRIVATE_REPO_REF}"
+          git commit -m "chore(lua): sync from ${RIME_MEM_PRIVATE_REPO_SLUG}@${{ steps.crate_version.outputs.version }}"
           echo "changed=true" >> "$GITHUB_OUTPUT"
 
       - name: Push changes

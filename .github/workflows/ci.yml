@@ -405,6 +405,42 @@ jobs:
       - macos-universal
 
     steps:
+      - name: Checkout public repo
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Check private repo token
+        run: |
+          if [ -z "${RIME_MEM_PRIVATE_REPO_TOKEN}" ]; then
+            echo "Missing secret: RIME_MEM_PRI_TOKEN"
+            echo "This secret must have read access to ${RIME_MEM_PRIVATE_REPO_SLUG}"
+            exit 1
+          fi
+
+      - name: Checkout private repo
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ env.RIME_MEM_PRIVATE_REPO_SLUG }}
+          token: ${{ env.RIME_MEM_PRIVATE_REPO_TOKEN }}
+          ref: ${{ env.RIME_MEM_PRIVATE_REPO_REF }}
+          path: private-src
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Read crate version
+        id: crate_version
+        run: |
+          python - <<'PY' >> "$GITHUB_OUTPUT"
+          from pathlib import Path
+          import tomllib
+
+          cargo_toml = Path("private-src/rime_mem/Cargo.toml")
+          data = tomllib.loads(cargo_toml.read_text(encoding="utf-8"))
+          print(f"version={data['package']['version']}")
+          PY
+
       - name: Download package artifacts
         uses: actions/download-artifact@v8
         with:
@@ -434,7 +470,7 @@ jobs:
               echo "EOF"
             } >> "$GITHUB_OUTPUT"
           else
-            echo "tag_name=staging" >> "$GITHUB_OUTPUT"
+            echo "tag_name=staging-v${{ steps.crate_version.outputs.version }}" >> "$GITHUB_OUTPUT"
             echo "release_name=Staging (${GITHUB_REF_NAME:-manual})" >> "$GITHUB_OUTPUT"
             echo "prerelease=true" >> "$GITHUB_OUTPUT"
             echo "make_latest=false" >> "$GITHUB_OUTPUT"
@@ -459,7 +495,7 @@ jobs:
           script: |
             const owner = context.repo.owner;
             const repo = context.repo.repo;
-            const tag = "staging";
+            const tag = "staging-v${{ steps.crate_version.outputs.version }}";
             const sha = context.sha;
 
             try {
