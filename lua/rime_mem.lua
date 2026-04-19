@@ -1,7 +1,7 @@
 return {
     processor = require("rime_mem_processor"),
     translator = require("rime_mem_translator"),
-    filter = require("rime_mem_filter")
+    filter = require("rime_mem_filter"),
 }
 
 -- librime-mem registration in rime.lua

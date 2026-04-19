@@ -1,9 +1,7 @@
 local M = {}
 local bridge = require("rime_mem_bridge")
 
-function M.normalize_token(raw)
-    return bridge.normalize_token(raw)
-end
+function M.normalize_token(raw) return bridge.normalize_token(raw) end
 
 function M.get_context(env)
     local ctx = env.engine.context
@@ -11,18 +9,18 @@ function M.get_context(env)
     local input = ctx.input
     local pinyin = ""
     local segment = ctx.composition:back()
-    if segment then
-        pinyin = input:sub(segment.start + 1, segment._end)
-    end
+    if segment then pinyin = input:sub(segment.start + 1, segment._end) end
 
     return {
         schema_id = schema_id,
         pinyin = pinyin,
         input = input,
-        left1 = M.get_last_word(env, 1),
-        left2 = M.get_last_word(env, 2)
+        prev_token1 = M.get_last_word(env, 1),
+        prev_token2 = M.get_last_word(env, 2),
     }
 end
+
+function M.is_history_query_input(input) return type(input) == "string" and input:match("^[a-z']+$") ~= nil end
 
 function M.get_last_word(env, offset)
     local words = env.rime_mem_words or {}
@@ -31,15 +29,11 @@ end
 
 function M.push_committed_word(env, word)
     local normalized_word = M.normalize_token(word)
-    if not normalized_word then
-        return
-    end
+    if not normalized_word then return end
 
     env.rime_mem_words = env.rime_mem_words or {}
     table.insert(env.rime_mem_words, normalized_word)
-    if #env.rime_mem_words > 8 then
-        table.remove(env.rime_mem_words, 1)
-    end
+    if #env.rime_mem_words > 8 then table.remove(env.rime_mem_words, 1) end
 end
 
 return M
